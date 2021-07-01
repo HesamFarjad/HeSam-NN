@@ -1,0 +1,232 @@
+
+
+![ -d vision_transformer ] || git clone --depth=1 https://github.com/google-research/vision_transformer
+!cd vision_transformer && git pull
+
+!pip install -qr vision_transformer/vit_jax/requirements.txt
+
+!gsutil ls -lh gs://vit_models/imagenet*
+!gsutil ls -lh gs://mixer_models/*
+
+model_name = 'ViT-B_32' 
+
+if model_name.startswith('ViT'):
+  ![ -e "$model_name".npz ] || gsutil cp gs://vit_models/imagenet21k/"$model_name".npz .
+if model_name.startswith('Mixer'):
+  ![ -e "$model_name".npz ] || gsutil cp gs://mixer_models/imagenet21k/"$model_name".npz .
+
+import os
+assert os.path.exists(f'{model_name}.npz')
+
+
+import os
+if 'google.colab' in str(get_ipython()) and 'COLAB_TPU_ADDR' in os.environ:
+  import jax
+  import jax.tools.colab_tpu
+  jax.tools.colab_tpu.setup_tpu()
+  print('Connected to TPU.')
+else:
+  print('No TPU detected. Can be changed under "Runtime/Change runtime type".')
+
+from absl import logging
+import flax
+import jax
+from matplotlib import pyplot as plt
+import numpy as np
+import tqdm
+
+logging.set_verbosity(logging.INFO)
+
+jax.local_devices()
+
+import sys
+if './vision_transformer' not in sys.path:
+  sys.path.append('./vision_transformer')
+
+%load_ext autoreload
+%autoreload 2
+
+from vit_jax import checkpoint
+from vit_jax import input_pipeline
+from vit_jax import utils
+from vit_jax import models
+from vit_jax import momentum_clip
+from vit_jax import train
+from vit_jax.configs import common as common_config
+from vit_jax.configs import models as models_config
+
+labelnames = dict(
+  # https://www.cs.toronto.edu/~kriz/cifar.html
+  cifar10=('airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck'),
+  # https://www.cs.toronto.edu/~kriz/cifar.html
+  cifar100=('apple', 'aquarium_fish', 'baby', 'bear', 'beaver', 'bed', 'bee', 'beetle', 'bicycle', 'bottle', 'bowl', 'boy', 'bridge', 'bus', 'butterfly', 'camel', 'can', 'castle', 'caterpillar', 'cattle', 'chair', 'chimpanzee', 'clock', 'cloud', 'cockroach', 'couch', 'crab', 'crocodile', 'cup', 'dinosaur', 'dolphin', 'elephant', 'flatfish', 'forest', 'fox', 'girl', 'hamster', 'house', 'kangaroo', 'computer_keyboard', 'lamp', 'lawn_mower', 'leopard', 'lion', 'lizard', 'lobster', 'man', 'maple_tree', 'motorcycle', 'mountain', 'mouse', 'mushroom', 'oak_tree', 'orange', 'orchid', 'otter', 'palm_tree', 'pear', 'pickup_truck', 'pine_tree', 'plain', 'plate', 'poppy', 'porcupine', 'possum', 'rabbit', 'raccoon', 'ray', 'road', 'rocket', 'rose', 'sea', 'seal', 'shark', 'shrew', 'skunk', 'skyscraper', 'snail', 'snake', 'spider', 'squirrel', 'streetcar', 'sunflower', 'sweet_pepper', 'table', 'tank', 'telephone', 'television', 'tiger', 'tractor', 'train', 'trout', 'tulip', 'turtle', 'wardrobe', 'whale', 'willow_tree', 'wolf', 'woman', 'worm')
+)
+def make_label_getter(dataset):
+  """Returns a function converting label indices to names."""
+  def getter(label):
+    if dataset in labelnames:
+      return labelnames[dataset][label]
+    return f'label={label}'
+  return getter
+
+def show_img(img, ax=None, title=None):
+  """Shows a single image."""
+  if ax is None:
+    ax = plt.gca()
+  ax.imshow(img[...])
+  ax.set_xticks([])
+  ax.set_yticks([])
+  if title:
+    ax.set_title(title)
+
+def show_img_grid(imgs, titles):
+  """Shows a grid of images."""
+  n = int(np.ceil(len(imgs)**.5))
+  _, axs = plt.subplots(n, n, figsize=(3 * n, 3 * n))
+  for i, (img, title) in enumerate(zip(imgs, titles)):
+    img = (img + 1) / 2  # Denormalize
+    show_img(img, axs[i // n][i % n], title)
+
+### Load dataset
+
+dataset = 'cifar10'
+batch_size = 512
+config = common_config.with_dataset(common_config.get_config(), dataset)
+num_classes = input_pipeline.get_dataset_info(dataset, 'train')['num_classes']
+config.batch = batch_size
+config.pp.crop = 224
+
+ds_train = input_pipeline.get_data_from_tfds(config=config, mode='train')
+ds_test = input_pipeline.get_data_from_tfds(config=config, mode='test')
+
+del config 
+
+batch = next(iter(ds_test.as_numpy_iterator()))
+batch['image'].shape
+
+images, labels = batch['image'][0][:9], batch['label'][0][:9]
+titles = map(make_label_getter(dataset), labels.argmax(axis=1))
+show_img_grid(images, titles)
+
+batch = next(iter(ds_train.as_numpy_iterator()))
+images, labels = batch['image'][0][:9], batch['label'][0][:9]
+titles = map(make_label_getter(dataset), labels.argmax(axis=1))
+show_img_grid(images, titles)
+
+### Load pre-trained
+
+model_config = models_config.MODEL_CONFIGS[model_name]
+model_config
+
+
+if model_name.startswith('Mixer'):
+  model = models.MlpMixer(num_classes=num_classes, **model_config)
+else:
+  model = models.VisionTransformer(num_classes=num_classes, **model_config)
+variables = jax.jit(lambda: model.init(
+    jax.random.PRNGKey(0),
+    batch['image'][0, :1],
+    train=False,
+), backend='cpu')()
+
+params = checkpoint.load_pretrained(
+    pretrained_path=f'{model_name}.npz',
+    init_params=variables['params'],
+    model_config=model_config,
+)
+
+### Evaluate
+
+params_repl = flax.jax_utils.replicate(params)
+print('params.cls:', type(params['head']['bias']).__name__,
+      params['head']['bias'].shape)
+print('params_repl.cls:', type(params_repl['head']['bias']).__name__,
+      params_repl['head']['bias'].shape)
+
+vit_apply_repl = jax.pmap(lambda params, inputs: model.apply(
+    dict(params=params), inputs, train=False))
+
+def get_accuracy(params_repl):
+  """Returns accuracy evaluated on the test set."""
+  good = total = 0
+  steps = input_pipeline.get_dataset_info(dataset, 'test')['num_examples'] // batch_size
+  for _, batch in zip(tqdm.trange(steps), ds_test.as_numpy_iterator()):
+    predicted = vit_apply_repl(params_repl, batch['image'])
+    is_same = predicted.argmax(axis=-1) == batch['label'].argmax(axis=-1)
+    good += is_same.sum()
+    total += len(is_same.flatten())
+  return good / total
+
+get_accuracy(params_repl)
+
+### Fine-tune
+
+total_steps = 100
+warmup_steps = 5
+decay_type = 'cosine'
+grad_norm_clip = 1
+
+accum_steps = 8
+base_lr = 0.03
+
+lr_fn = utils.create_learning_rate_schedule(total_steps, base_lr, decay_type, warmup_steps)
+update_fn_repl = train.make_update_fn(
+    apply_fn=model.apply, accum_steps=accum_steps, lr_fn=lr_fn)
+opt = momentum_clip.Optimizer(grad_norm_clip=grad_norm_clip).create(params)
+opt_repl = flax.jax_utils.replicate(opt)
+
+update_rng_repl = flax.jax_utils.replicate(jax.random.PRNGKey(0))
+
+losses = []
+lrs = []
+for step, batch in zip(
+    tqdm.trange(1, total_steps + 1),
+    ds_train.as_numpy_iterator(),
+):
+
+  opt_repl, loss_repl, update_rng_repl = update_fn_repl(
+      opt_repl, flax.jax_utils.replicate(step), batch, update_rng_repl)
+  losses.append(loss_repl[0])
+  lrs.append(lr_fn(step))
+
+plt.plot(losses)
+plt.figure()
+plt.plot(lrs)
+
+get_accuracy(opt_repl.target)
+
+### Inference
+
+if model_name.startswith('Mixer'):
+  # Download model trained on imagenet2012
+  ![ -e "$model_name"_imagenet2012.npz ] || gsutil cp gs://mixer_models/imagenet1k/"$model_name".npz "$model_name"_imagenet2012.npz
+  model = models.MlpMixer(num_classes=1000, **model_config)
+else:
+  # Download model pre-trained on imagenet21k and fine-tuned on imagenet2012.
+  ![ -e "$model_name"_imagenet2012.npz ] || gsutil cp gs://vit_models/imagenet21k+imagenet2012/"$model_name".npz "$model_name"_imagenet2012.npz
+  model = models.VisionTransformer(num_classes=1000, **model_config)
+
+import os
+assert os.path.exists(f'{model_name}_imagenet2012.npz')
+
+# Load and convert pretrained checkpoint.
+params = checkpoint.load(f'{model_name}_imagenet2012.npz')
+params['pre_logits'] = {}  # Need to restore empty leaf for Flax.
+
+# Get imagenet labels.
+!wget https://storage.googleapis.com/bit_models/ilsvrc2012_wordnet_lemmas.txt
+imagenet_labels = dict(enumerate(open('ilsvrc2012_wordnet_lemmas.txt')))
+
+# Get a random picture with the correct dimensions.
+resolution = 224 if model_name.startswith('Mixer') else 384
+!wget https://picsum.photos/$resolution -O picsum.jpg
+import PIL
+img = PIL.Image.open('picsum.jpg')
+img
+
+# Predict on a batch with a single item (note very efficient TPU usage...)
+logits, = model.apply(dict(params=params), (np.array(img) / 128 - 1)[None, ...], train=False)
+
+preds = flax.nn.softmax(logits)
+for idx in preds.argsort()[:-11:-1]:
+  print(f'{preds[idx]:.5f} : {imagenet_labels[idx]}', end='')
